@@ -870,6 +870,8 @@ class KafkaManager:
         replicas for a topic.
         Uses all brokers available and distributes them as replicas using
         a round robin method.
+        When preserve_leader is True, considers current replica set to minimize
+        partition movements.
         """
         assigments = []
         all_replicas = []
@@ -895,22 +897,63 @@ class KafkaManager:
             else:
                 for _, metadata in self.get_partitions_for_topic(
                         topic_name).items():
-                    _, partition, leader, _, _, _ = metadata
+                    _, partition, leader, current_replicas, _, _ = metadata
                     partition_replica_factor = replica_factor
                     replicas = []
+                    
                     if preserve_leader:
-                        partition_replica_factor -= 1
+                        # Preserve the current leader
                         replicas.append(leader)
                         overflow_nodes.append(leader)
-                    for _i in range(partition_replica_factor):
-                        broker = next(brokers_iterator)
-                        while broker in overflow_nodes or broker in replicas:
-                            if broker in overflow_nodes:
-                                overflow_nodes.remove(broker)
+                        
+                        # Get current replica set to minimize movements
+                        if (topic_name, partition) in topics_configuration:
+                            current_assignment = topics_configuration[(topic_name, partition)]
+                            
+                            if len(current_assignment) >= replica_factor:
+                                # Decreasing replica factor: preserve leader + existing replicas, trim from end
+                                # Remove leader from current assignment to avoid duplication
+                                other_replicas = [r for r in current_assignment if r != leader]
+                                # Take remaining replicas from the existing set (preserving order)
+                                remaining_replicas = other_replicas[:replica_factor - 1]
+                                replicas.extend(remaining_replicas)
+                            else:
+                                # Increasing replica factor: preserve existing replicas, add new ones
+                                # Add existing replicas (excluding leader to avoid duplication)
+                                existing_other_replicas = [r for r in current_assignment if r != leader]
+                                replicas.extend(existing_other_replicas)
+                                
+                                # Calculate how many new replicas we need
+                                needed_new_replicas = replica_factor - len(replicas)
+                                
+                                # Add new replicas using round-robin, avoiding existing ones
+                                for _i in range(needed_new_replicas):
+                                    broker = next(brokers_iterator)
+                                    while broker in overflow_nodes or broker in replicas:
+                                        if broker in overflow_nodes:
+                                            overflow_nodes.remove(broker)
+                                        broker = next(brokers_iterator)
+                                    replicas.append(broker)
+                        else:
+                            # No current assignment info, fall back to original logic
+                            for _i in range(partition_replica_factor - 1):
+                                broker = next(brokers_iterator)
+                                while broker in overflow_nodes or broker in replicas:
+                                    if broker in overflow_nodes:
+                                        overflow_nodes.remove(broker)
+                                    broker = next(brokers_iterator)
+                                replicas.append(broker)
+                    else:
+                        # Original logic when preserve_leader is False
+                        for _i in range(partition_replica_factor):
                             broker = next(brokers_iterator)
-                        replicas.append(broker)
-                    current_assignment = topics_configuration[(
-                        topic_name, partition)]
+                            while broker in overflow_nodes or broker in replicas:
+                                if broker in overflow_nodes:
+                                    overflow_nodes.remove(broker)
+                                broker = next(brokers_iterator)
+                            replicas.append(broker)
+                    
+                    current_assignment = topics_configuration.get((topic_name, partition), [])
                     sorted(replicas)
                     sorted(current_assignment)
                     if (topic_name, partition) in topics_configuration and \
@@ -935,6 +978,8 @@ class KafkaManager:
         replicas for a topic.
         Uses all brokers available and distributes them as replicas using
         a round robin method.
+        When preserve_leader is True, considers current replica set to minimize
+        partition movements.
         """
         all_replicas = []
         assign = {'partitions': [], 'version': 1}
@@ -961,22 +1006,63 @@ class KafkaManager:
             else:
                 for _, metadata in self.get_partitions_for_topic(
                         topic_name).items():
-                    _, partition, leader, _, _, _ = metadata
+                    _, partition, leader, current_replicas, _, _ = metadata
                     partition_replica_factor = replica_factor
                     replicas = []
+                    
                     if preserve_leader:
-                        partition_replica_factor -= 1
+                        # Preserve the current leader
                         replicas.append(leader)
                         overflow_nodes.append(leader)
-                    for _i in range(partition_replica_factor):
-                        broker = next(brokers_iterator)
-                        while broker in overflow_nodes or broker in replicas:
-                            if broker in overflow_nodes:
-                                overflow_nodes.remove(broker)
+                        
+                        # Get current replica set to minimize movements
+                        if (topic_name, partition) in topics_configuration:
+                            current_assignment = topics_configuration[(topic_name, partition)]
+                            
+                            if len(current_assignment) >= replica_factor:
+                                # Decreasing replica factor: preserve leader + existing replicas, trim from end
+                                # Remove leader from current assignment to avoid duplication
+                                other_replicas = [r for r in current_assignment if r != leader]
+                                # Take remaining replicas from the existing set (preserving order)
+                                remaining_replicas = other_replicas[:replica_factor - 1]
+                                replicas.extend(remaining_replicas)
+                            else:
+                                # Increasing replica factor: preserve existing replicas, add new ones
+                                # Add existing replicas (excluding leader to avoid duplication)
+                                existing_other_replicas = [r for r in current_assignment if r != leader]
+                                replicas.extend(existing_other_replicas)
+                                
+                                # Calculate how many new replicas we need
+                                needed_new_replicas = replica_factor - len(replicas)
+                                
+                                # Add new replicas using round-robin, avoiding existing ones
+                                for _i in range(needed_new_replicas):
+                                    broker = next(brokers_iterator)
+                                    while broker in overflow_nodes or broker in replicas:
+                                        if broker in overflow_nodes:
+                                            overflow_nodes.remove(broker)
+                                        broker = next(brokers_iterator)
+                                    replicas.append(broker)
+                        else:
+                            # No current assignment info, fall back to original logic
+                            for _i in range(partition_replica_factor - 1):
+                                broker = next(brokers_iterator)
+                                while broker in overflow_nodes or broker in replicas:
+                                    if broker in overflow_nodes:
+                                        overflow_nodes.remove(broker)
+                                    broker = next(brokers_iterator)
+                                replicas.append(broker)
+                    else:
+                        # Original logic when preserve_leader is False
+                        for _i in range(partition_replica_factor):
                             broker = next(brokers_iterator)
-                        replicas.append(broker)
-                    current_assignment = topics_configuration[(
-                        topic_name, partition)]
+                            while broker in overflow_nodes or broker in replicas:
+                                if broker in overflow_nodes:
+                                    overflow_nodes.remove(broker)
+                                broker = next(brokers_iterator)
+                            replicas.append(broker)
+                    
+                    current_assignment = topics_configuration.get((topic_name, partition), [])
                     sorted(replicas)
                     sorted(current_assignment)
                     if (topic_name, partition) in topics_configuration and \
