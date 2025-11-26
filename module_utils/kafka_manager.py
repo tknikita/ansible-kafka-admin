@@ -1136,6 +1136,100 @@ Cf core/src/main/scala/kafka/admin/ReassignPartitionsCommand.scala#L580
             assignment when using Kafka <= 2.4.0.')
         self.refresh()
 
+    def apply_json_assignment(self, topic_name, json_assignment):
+        """
+        Apply a custom JSON assignment to a topic.
+        This allows manual specification of partition-to-broker assignments.
+        
+        Args:
+            topic_name: Name of the topic
+            json_assignment: JSON assignment in format:
+                {"partitions": [{"topic": "topic_name", "partition": 0, "replicas": [1001, 1002]}]}
+        """
+        if isinstance(json_assignment, str):
+            assignment_data = json.loads(json_assignment)
+        else:
+            assignment_data = json_assignment
+            
+        if 'partitions' not in assignment_data:
+            raise KafkaManagerError('JSON assignment must contain "partitions" array')
+            
+        partitions = assignment_data['partitions']
+        
+        # Validate that all partitions belong to the specified topic
+        for partition in partitions:
+            if partition['topic'] != topic_name:
+                raise KafkaManagerError(
+                    'Partition assignment topic "%s" does not match requested topic "%s"' %
+                    (partition['topic'], topic_name)
+                )
+        
+        # Convert to the format expected by update_admin_assignments
+        topics_configuration = {}
+        for partition in partitions:
+            partition_id = partition['partition']
+            replicas = partition['replicas']
+            topics_configuration[(topic_name, partition_id)] = replicas
+            
+        # Create a topics dict with the assignment
+        topics = {
+            topic_name: {
+                'replica_factor': len(partitions[0]['replicas']) if partitions else 1,
+                'preserve_leader': False,
+                'json_assignment': True
+            }
+        }
+        
+        # Use the existing assignment update mechanism
+        if parse_version(self.get_api_version()) >= parse_version('2.4.0'):
+            # For Kafka >= 2.4.0, use the new API
+            assign = []
+            for partition in partitions:
+                assign.append((
+                    topic_name,
+                    [(partition['partition'], partition['replicas'], {})],
+                    {}
+                ))
+            
+            if assign:
+                request = AlterPartitionReassignmentsRequest_v0(
+                    timeout_ms=self.request_timeout_ms,
+                    topics=assign,
+                    tags={}
+                )
+                self.wait_for_partition_assignement()
+                self.send_request_and_get_response(request)
+                self.wait_for_partition_assignement()
+        elif self.zk_configuration is not None:
+            # For older Kafka versions, use ZooKeeper
+            try:
+                # Create ZooKeeper format assignment
+                zk_assignment = {
+                    'version': 1,
+                    'partitions': [
+                        {
+                            'topic': topic_name,
+                            'partition': partition['partition'],
+                            'replicas': partition['replicas']
+                        }
+                        for partition in partitions
+                    ]
+                }
+                
+                self.init_zk_client()
+                self.wait_for_znode_assignment()
+                self.zk_client.create(
+                    self.ZK_REASSIGN_NODE,
+                    json.dumps(zk_assignment, ensure_ascii=False).encode('utf-8')
+                )
+                self.wait_for_znode_assignment()
+            finally:
+                self.close_zk_client()
+        else:
+            raise KafkaManagerError('Zookeeper is mandatory for partition assignment when using Kafka <= 2.4.0.')
+            
+        self.refresh()
+
     def update_topic_assignment(self, json_assignment, zknode):
         """
  Updates the topic partition assignment using a json assignment
