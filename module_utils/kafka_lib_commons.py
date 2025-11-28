@@ -1,4 +1,6 @@
 import os
+import logging
+import traceback
 from pkg_resources import parse_version
 
 from ansible.module_utils.kafka_lib_errors import IncompatibleVersion
@@ -6,6 +8,15 @@ from ansible.module_utils.kafka_manager import KafkaManager
 from ansible.module_utils.ssl_utils import (
     generate_ssl_object, generate_ssl_context
 )
+
+# Set up logging for SSL cleanup debugging
+ssl_cleanup_logger = logging.getLogger('kafka_ssl_cleanup')
+ssl_cleanup_logger.setLevel(logging.DEBUG)
+if not ssl_cleanup_logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    ssl_cleanup_logger.addHandler(handler)
 
 DOCUMENTATION_COMMON = '''
   bootstrap_servers:
@@ -94,6 +105,8 @@ module_topic_commons = dict(
     force_reassign=dict(type='bool', required=False, default=False),
 
     preserve_leader=dict(type='bool', required=False, default=False),
+
+    preserve_current_replicas=dict(type='bool', required=False, default=False),
 
     json_assignment=dict(type='json', required=False, default=None),
 
@@ -371,23 +384,77 @@ def maybe_clean_kafka_ssl_files(params, kafka_ssl_files=None):
         params: Module parameters
         kafka_ssl_files: Optional pre-generated SSL files object to avoid recreation
     """
-    if kafka_ssl_files is None:
-        # Fallback to old behavior if SSL files not provided
-        ssl_cafile = params['ssl_cafile']
-        ssl_certfile = params['ssl_certfile']
-        ssl_keyfile = params['ssl_keyfile']
-        ssl_crlfile = params['ssl_crlfile']
-
-        kafka_ssl_files = generate_ssl_object(
-            ssl_cafile, ssl_certfile, ssl_keyfile, ssl_crlfile
-        )
-
-    for _key, value in kafka_ssl_files.items():
-        if (
-                value['path'] is not None and value['is_temp'] and
-                os.path.exists(os.path.dirname(value['path']))
-        ):
-            os.remove(value['path'])
+    ssl_cleanup_logger.debug("Starting SSL temp file cleanup process")
+    
+    try:
+        if kafka_ssl_files is None:
+            # Fallback to old behavior if SSL files not provided
+            ssl_cafile = params.get('ssl_cafile')
+            ssl_certfile = params.get('ssl_certfile')
+            ssl_keyfile = params.get('ssl_keyfile')
+            ssl_crlfile = params.get('ssl_crlfile')
+            
+            ssl_cleanup_logger.debug(f"SSL file parameters - cafile: {ssl_cafile}, "
+                                   f"certfile: {ssl_certfile}, keyfile: {ssl_keyfile}, "
+                                   f"crlfile: {ssl_crlfile}")
+            
+            if not any([ssl_cafile, ssl_certfile, ssl_keyfile, ssl_crlfile]):
+                ssl_cleanup_logger.debug("No SSL files provided, skipping cleanup")
+                return
+                
+            ssl_cleanup_logger.debug("Generating SSL object to identify temp files")
+            kafka_ssl_files = generate_ssl_object(
+                ssl_cafile, ssl_certfile, ssl_keyfile, ssl_crlfile
+            )
+        
+        ssl_cleanup_logger.debug(f"Generated SSL files object: {kafka_ssl_files}")
+        
+        cleanup_count = 0
+        for key, value in kafka_ssl_files.items():
+            ssl_cleanup_logger.debug(f"Processing SSL file type: {key}")
+            ssl_cleanup_logger.debug(f"File details - path: {value['path']}, "
+                                   f"is_temp: {value['is_temp']}")
+            
+            if (value['path'] is not None and value['is_temp']):
+                ssl_cleanup_logger.debug(f"File {value['path']} is identified as temporary")
+                
+                # Check if directory exists
+                dir_exists = os.path.exists(os.path.dirname(value['path']))
+                ssl_cleanup_logger.debug(f"Directory exists for {value['path']}: {dir_exists}")
+                
+                if dir_exists:
+                    # Check if file exists before trying to delete
+                    file_exists = os.path.exists(value['path'])
+                    ssl_cleanup_logger.debug(f"File exists before deletion: {file_exists}")
+                    
+                    if file_exists:
+                        try:
+                            ssl_cleanup_logger.info(f"Attempting to delete temp SSL file: {value['path']}")
+                            os.remove(value['path'])
+                            cleanup_count += 1
+                            ssl_cleanup_logger.info(f"Successfully deleted temp SSL file: {value['path']}")
+                        except OSError as e:
+                            ssl_cleanup_logger.error(f"Failed to delete temp SSL file {value['path']}: {e}")
+                            ssl_cleanup_logger.debug(f"OSError details: {traceback.format_exc()}")
+                        except Exception as e:
+                            ssl_cleanup_logger.error(f"Unexpected error deleting temp SSL file {value['path']}: {e}")
+                            ssl_cleanup_logger.debug(f"Exception details: {traceback.format_exc()}")
+                    else:
+                        ssl_cleanup_logger.warning(f"Temp SSL file {value['path']} does not exist, skipping deletion")
+                else:
+                    ssl_cleanup_logger.warning(f"Directory for temp SSL file {value['path']} does not exist, skipping deletion")
+            else:
+                ssl_cleanup_logger.debug(f"Skipping {key} file - not temporary or no path: "
+                                       f"path={value['path']}, is_temp={value['is_temp']}")
+        
+        ssl_cleanup_logger.info(f"SSL temp file cleanup completed. Files cleaned: {cleanup_count}")
+        
+    except KeyError as e:
+        ssl_cleanup_logger.error(f"Missing required parameter in SSL cleanup: {e}")
+        ssl_cleanup_logger.debug(f"KeyError traceback: {traceback.format_exc()}")
+    except Exception as e:
+        ssl_cleanup_logger.error(f"Unexpected error in SSL temp file cleanup: {e}")
+        ssl_cleanup_logger.debug(f"Exception traceback: {traceback.format_exc()}")
 
 
 def get_zookeeper_ssl_files(params):
@@ -451,31 +518,81 @@ def get_zookeeper_configuration(params):
 
 def maybe_clean_zk_ssl_files(params, zookeeper_ssl_files=None):
     """
-    Clean up temporary Zookeeper SSL files.
-    
-    Args:
-        params: Module parameters
-        zookeeper_ssl_files: Optional pre-generated SSL files object to avoid recreation
+    Clean up temporary ZooKeeper SSL files created during operations.
+    This function includes comprehensive debug logging for troubleshooting.
     """
-    if zookeeper_ssl_files is None:
-        # Fallback to old behavior if SSL files not provided
-        if ('zookeeper_ssl_cafile' in params and
-                'zookeeper_ssl_certfile' in params and
-                'zookeeper_ssl_keyfile' in params):
-            zookeeper_ssl_cafile = params['zookeeper_ssl_cafile']
-            zookeeper_ssl_certfile = params['zookeeper_ssl_certfile']
-            zookeeper_ssl_keyfile = params['zookeeper_ssl_keyfile']
-
-            zookeeper_ssl_files = generate_ssl_object(
-                zookeeper_ssl_cafile, zookeeper_ssl_certfile,
-                zookeeper_ssl_keyfile
-            )
-        else:
-            return
-
-    for _key, value in zookeeper_ssl_files.items():
-        if (
-                value['path'] is not None and value['is_temp'] and
-                os.path.exists(os.path.dirname(value['path']))
-        ):
-            os.remove(value['path'])
+    ssl_cleanup_logger.debug("Starting ZooKeeper SSL temp file cleanup process")
+    
+    try:
+        if zookeeper_ssl_files is None:
+            # Fallback to old behavior if SSL files not provided
+            if ('zookeeper_ssl_cafile' in params and
+                    'zookeeper_ssl_certfile' in params and
+                    'zookeeper_ssl_keyfile' in params):
+                zookeeper_ssl_cafile = params['zookeeper_ssl_cafile']
+                zookeeper_ssl_certfile = params['zookeeper_ssl_certfile']
+                zookeeper_ssl_keyfile = params['zookeeper_ssl_keyfile']
+                
+                ssl_cleanup_logger.debug(f"ZooKeeper SSL file parameters - cafile: {zookeeper_ssl_cafile}, "
+                                       f"certfile: {zookeeper_ssl_certfile}, keyfile: {zookeeper_ssl_keyfile}")
+                
+                if not any([zookeeper_ssl_cafile, zookeeper_ssl_certfile, zookeeper_ssl_keyfile]):
+                    ssl_cleanup_logger.debug("No ZooKeeper SSL files provided, skipping cleanup")
+                    return
+                    
+                ssl_cleanup_logger.debug("Generating ZooKeeper SSL object to identify temp files")
+                zookeeper_ssl_files = generate_ssl_object(
+                    zookeeper_ssl_cafile, zookeeper_ssl_certfile,
+                    zookeeper_ssl_keyfile
+                )
+            else:
+                return
+            
+        ssl_cleanup_logger.debug(f"Generated ZooKeeper SSL files object: {zookeeper_ssl_files}")
+        
+        cleanup_count = 0
+        for key, value in zookeeper_ssl_files.items():
+            ssl_cleanup_logger.debug(f"Processing ZooKeeper SSL file type: {key}")
+            ssl_cleanup_logger.debug(f"File details - path: {value['path']}, "
+                                   f"is_temp: {value['is_temp']}")
+            
+            if (value['path'] is not None and value['is_temp']):
+                ssl_cleanup_logger.debug(f"ZooKeeper file {value['path']} is identified as temporary")
+                
+                # Check if directory exists
+                dir_exists = os.path.exists(os.path.dirname(value['path']))
+                ssl_cleanup_logger.debug(f"Directory exists for {value['path']}: {dir_exists}")
+                
+                if dir_exists:
+                    # Check if file exists before trying to delete
+                    file_exists = os.path.exists(value['path'])
+                    ssl_cleanup_logger.debug(f"ZooKeeper file exists before deletion: {file_exists}")
+                    
+                    if file_exists:
+                        try:
+                            ssl_cleanup_logger.info(f"Attempting to delete temp ZooKeeper SSL file: {value['path']}")
+                            os.remove(value['path'])
+                            cleanup_count += 1
+                            ssl_cleanup_logger.info(f"Successfully deleted temp ZooKeeper SSL file: {value['path']}")
+                        except OSError as e:
+                            ssl_cleanup_logger.error(f"Failed to delete temp ZooKeeper SSL file {value['path']}: {e}")
+                            ssl_cleanup_logger.debug(f"OSError details: {traceback.format_exc()}")
+                        except Exception as e:
+                            ssl_cleanup_logger.error(f"Unexpected error deleting temp ZooKeeper SSL file {value['path']}: {e}")
+                            ssl_cleanup_logger.debug(f"Exception details: {traceback.format_exc()}")
+                    else:
+                        ssl_cleanup_logger.warning(f"Temp ZooKeeper SSL file {value['path']} does not exist, skipping deletion")
+                else:
+                    ssl_cleanup_logger.warning(f"Directory for temp ZooKeeper SSL file {value['path']} does not exist, skipping deletion")
+            else:
+                ssl_cleanup_logger.debug(f"Skipping ZooKeeper {key} file - not temporary or no path: "
+                                       f"path={value['path']}, is_temp={value['is_temp']}")
+        
+        ssl_cleanup_logger.info(f"ZooKeeper SSL temp file cleanup completed. Files cleaned: {cleanup_count}")
+        
+    except KeyError as e:
+        ssl_cleanup_logger.error(f"Missing required parameter in ZooKeeper SSL cleanup: {e}")
+        ssl_cleanup_logger.debug(f"KeyError traceback: {traceback.format_exc()}")
+    except Exception as e:
+        ssl_cleanup_logger.error(f"Unexpected error in ZooKeeper SSL temp file cleanup: {e}")
+        ssl_cleanup_logger.debug(f"Exception traceback: {traceback.format_exc()}")

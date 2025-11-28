@@ -51,6 +51,13 @@ def process_module_topics(module, params=None):
                 )
                 return
             
+            # Validate preserve_leader and preserve_current_replicas conflicts
+            if topic.get('preserve_leader', False) and topic.get('preserve_current_replicas', False):
+                module.fail_json(
+                    msg='Cannot use both preserve_leader and preserve_current_replicas for topic %s' % topic['name']
+                )
+                return
+            
             # Validate JSON assignment format
             try:
                 if isinstance(json_assignment, str):
@@ -230,6 +237,7 @@ def process_module_topic(module):
         'replica_factor': params['replica_factor'],
         'force_reassign': params['force_reassign'],
         'preserve_leader': params['preserve_leader'],
+        'preserve_current_replicas': params['preserve_current_replicas'],
         'json_assignment': params['json_assignment'],
         'state': params['state'],
         'options': params['options']

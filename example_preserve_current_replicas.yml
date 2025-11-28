@@ -1,0 +1,108 @@
+---
+# Example playbook demonstrating preserve_current_replicas functionality
+
+- name: Kafka Topic Management with Preserve Current Replicas
+  hosts: localhost
+  gather_facts: no
+  tasks:
+    
+    # Example 1: Create a topic with initial replica factor
+    - name: Create topic with replica factor 3
+      kafka_topic:
+        name: 'test-topic-preserve'
+        partitions: 3
+        replica_factor: 3
+        state: 'present'
+        bootstrap_servers: 'localhost:9092'
+        api_version: '2.4.0'
+      register: topic_creation
+    
+    - name: Display topic creation result
+      debug:
+        var: topic_creation
+    
+    # Example 2: Decrease replica factor while preserving current replicas
+    # This will remove replicas from the end of the current replica set
+    - name: Decrease replica factor to 2 with preserve_current_replicas
+      kafka_topic:
+        name: 'test-topic-preserve'
+        replica_factor: 2
+        preserve_current_replicas: true
+        state: 'present'
+        bootstrap_servers: 'localhost:9092'
+        api_version: '2.4.0'
+      register: replica_decrease
+    
+    - name: Display replica decrease result
+      debug:
+        var: replica_decrease
+    
+    # Example 3: Increase replica factor while preserving current replicas
+    # This will add new replicas to the existing replica set
+    - name: Increase replica factor to 4 with preserve_current_replicas
+      kafka_topic:
+        name: 'test-topic-preserve'
+        replica_factor: 4
+        preserve_current_replicas: true
+        state: 'present'
+        bootstrap_servers: 'localhost:9092'
+        api_version: '2.4.0'
+      register: replica_increase
+    
+    - name: Display replica increase result
+      debug:
+        var: replica_increase
+    
+    # Example 4: Compare with preserve_leader approach
+    # This preserves only the leader and reassigns other replicas
+    - name: Use preserve_leader for comparison
+      kafka_topic:
+        name: 'test-topic-preserve'
+        replica_factor: 3
+        preserve_leader: true
+        state: 'present'
+        bootstrap_servers: 'localhost:9092'
+        api_version: '2.4.0'
+      register: preserve_leader_result
+    
+    - name: Display preserve_leader result
+      debug:
+        var: preserve_leader_result
+    
+    # Example 5: Error handling - cannot use both parameters
+    - name: Try to use both preserve_leader and preserve_current_replicas
+      kafka_topic:
+        name: 'test-topic-preserve'
+        replica_factor: 2
+        preserve_leader: true
+        preserve_current_replicas: true
+        state: 'present'
+        bootstrap_servers: 'localhost:9092'
+        api_version: '2.4.0'
+      ignore_errors: yes
+      register: conflict_error
+    
+    - name: Display conflict error
+      debug:
+        var: conflict_error
+    
+    # Example 6: Multiple topics with different approaches
+    - name: Create multiple topics with different replica management strategies
+      kafka_topic:
+        name: "{{ item.name }}"
+        partitions: "{{ item.partitions }}"
+        replica_factor: "{{ item.replica_factor }}"
+        preserve_current_replicas: "{{ item.preserve_current_replicas | default(false) }}"
+        preserve_leader: "{{ item.preserve_leader | default(false) }}"
+        state: 'present'
+        bootstrap_servers: 'localhost:9092'
+        api_version: '2.4.0'
+      loop:
+        - { name: 'topic-preserve-1', partitions: 2, replica_factor: 2, preserve_current_replicas: true }
+        - { name: 'topic-preserve-2', partitions: 2, replica_factor: 3, preserve_current_replicas: true }
+        - { name: 'topic-preserve-3', partitions: 2, replica_factor: 2, preserve_leader: true }
+      register: multi_topic_result
+    
+    - name: Display multi-topic result
+      debug:
+        var: multi_topic_result
