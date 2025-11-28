@@ -353,19 +353,32 @@ def get_manager_from_params(params):
     if 'zookeeper_max_retries' in params:
         manager.zookeeper_max_retries = params['zookeeper_max_retries']
 
+    # Store SSL files information for cleanup
+    manager.kafka_ssl_files = kafka_ssl_files
+    if 'zookeeper' in params and manager.zk_configuration:
+        manager.zookeeper_ssl_files = get_zookeeper_ssl_files(params)
+
     return manager
 
 
-def maybe_clean_kafka_ssl_files(params):
+def maybe_clean_kafka_ssl_files(params, kafka_ssl_files=None):
+    """
+    Clean up temporary Kafka SSL files.
+    
+    Args:
+        params: Module parameters
+        kafka_ssl_files: Optional pre-generated SSL files object to avoid recreation
+    """
+    if kafka_ssl_files is None:
+        # Fallback to old behavior if SSL files not provided
+        ssl_cafile = params['ssl_cafile']
+        ssl_certfile = params['ssl_certfile']
+        ssl_keyfile = params['ssl_keyfile']
+        ssl_crlfile = params['ssl_crlfile']
 
-    ssl_cafile = params['ssl_cafile']
-    ssl_certfile = params['ssl_certfile']
-    ssl_keyfile = params['ssl_keyfile']
-    ssl_crlfile = params['ssl_crlfile']
-
-    kafka_ssl_files = generate_ssl_object(
-        ssl_cafile, ssl_certfile, ssl_keyfile, ssl_crlfile
-    )
+        kafka_ssl_files = generate_ssl_object(
+            ssl_cafile, ssl_certfile, ssl_keyfile, ssl_crlfile
+        )
 
     for _key, value in kafka_ssl_files.items():
         if (
@@ -373,6 +386,25 @@ def maybe_clean_kafka_ssl_files(params):
                 os.path.exists(os.path.dirname(value['path']))
         ):
             os.remove(value['path'])
+
+
+def get_zookeeper_ssl_files(params):
+    """
+    Generate SSL files object for zookeeper without creating configuration.
+    This is used for cleanup purposes.
+    """
+    if ('zookeeper_ssl_cafile' in params and
+            'zookeeper_ssl_certfile' in params and
+            'zookeeper_ssl_keyfile' in params):
+        zookeeper_ssl_cafile = params['zookeeper_ssl_cafile']
+        zookeeper_ssl_certfile = params['zookeeper_ssl_certfile']
+        zookeeper_ssl_keyfile = params['zookeeper_ssl_keyfile']
+
+        return generate_ssl_object(
+            zookeeper_ssl_cafile, zookeeper_ssl_certfile,
+            zookeeper_ssl_keyfile
+        )
+    return None
 
 
 def get_zookeeper_configuration(params):
@@ -415,23 +447,33 @@ def get_zookeeper_configuration(params):
     return None
 
 
-def maybe_clean_zk_ssl_files(params):
+def maybe_clean_zk_ssl_files(params, zookeeper_ssl_files=None):
+    """
+    Clean up temporary Zookeeper SSL files.
+    
+    Args:
+        params: Module parameters
+        zookeeper_ssl_files: Optional pre-generated SSL files object to avoid recreation
+    """
+    if zookeeper_ssl_files is None:
+        # Fallback to old behavior if SSL files not provided
+        if ('zookeeper_ssl_cafile' in params and
+                'zookeeper_ssl_certfile' in params and
+                'zookeeper_ssl_keyfile' in params):
+            zookeeper_ssl_cafile = params['zookeeper_ssl_cafile']
+            zookeeper_ssl_certfile = params['zookeeper_ssl_certfile']
+            zookeeper_ssl_keyfile = params['zookeeper_ssl_keyfile']
 
-    if ('zookeeper_ssl_cafile' in params and
-            'zookeeper_ssl_certfile' in params and
-            'zookeeper_ssl_keyfile' in params):
-        zookeeper_ssl_cafile = params['zookeeper_ssl_cafile']
-        zookeeper_ssl_certfile = params['zookeeper_ssl_certfile']
-        zookeeper_ssl_keyfile = params['zookeeper_ssl_keyfile']
+            zookeeper_ssl_files = generate_ssl_object(
+                zookeeper_ssl_cafile, zookeeper_ssl_certfile,
+                zookeeper_ssl_keyfile
+            )
+        else:
+            return
 
-        zookeeper_ssl_files = generate_ssl_object(
-            zookeeper_ssl_cafile, zookeeper_ssl_certfile,
-            zookeeper_ssl_keyfile
-        )
-
-        for _key, value in zookeeper_ssl_files.items():
-            if (
-                    value['path'] is not None and value['is_temp'] and
-                    os.path.exists(os.path.dirname(value['path']))
-            ):
-                os.remove(value['path'])
+    for _key, value in zookeeper_ssl_files.items():
+        if (
+                value['path'] is not None and value['is_temp'] and
+                os.path.exists(os.path.dirname(value['path']))
+        ):
+            os.remove(value['path'])
