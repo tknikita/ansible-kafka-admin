@@ -65,6 +65,14 @@ options:
       - 'when reassign topic/partition try to preserve topic/partition'
       - 'leader to limit downtime.'
     default: False
+  json_assignment:
+    description:
+      - 'JSON assignment for topic partitions to manually specify'
+      - 'broker assignments. Useful for draining brokers from topics.'
+      - 'Format: {"partitions": [{"topic": "topic_name", "partition": 0, "replicas": [1001, 1002]}]}'
+      - 'Cannot be used with partitions, replica_factor, or force_reassign.'
+    required: False
+    type: json
   state:
     description:
       - 'state of the managed resource.'

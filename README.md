@@ -109,6 +109,22 @@ Here some examples on how to use this library:
       force_reassign: True
       preserve_leader: True
 
+# Using JSON assignment for manual partition-to-broker assignment (useful for draining brokers)
+- name: reassign partitions using JSON assignment
+  kafka_topic:
+    api_version: "2.6.0"
+    name: "test"
+    bootstrap_servers: "{{ hostvars['kafka1']['ansible_eth0']['ipv4']['address'] }}:9092,{{ hostvars['kafka2']['ansible_eth0']['ipv4']['address'] }}:9092"
+    state: "present"
+    json_assignment:
+      partitions:
+        - topic: "test"
+          partition: 0
+          replicas: [1001, 1002]
+        - topic: "test"
+          partition: 1
+          replicas: [1002, 1003]
+
 # creates a topic 'test' with provided configuation for plaintext configured Kafka and Zookeeper
 - name: create topic
   kafka_topic:

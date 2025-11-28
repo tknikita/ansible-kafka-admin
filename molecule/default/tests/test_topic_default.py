@@ -644,3 +644,169 @@ def test_duplicated_topics(host):
     for result in results:
         assert not result['changed']
         assert 'duplicated topics' in result['msg']
+
+
+def test_preserve_leader_minimizes_partition_movement(host):
+    """
+    Test that preserve_leader=True minimizes partition movements by
+    preserving existing replica set when possible.
+    """
+    # Given
+    topic_name = get_topic_name()
+    
+    # Create topic with replica factor 3
+    initial_config = topic_defaut_configuration.copy()
+    initial_config.update({
+        'replica_factor': 3,
+        'partitions': 1
+    })
+    ensure_kafka_topic(
+        host,
+        initial_config,
+        topic_name
+    )
+    time.sleep(0.3)
+    
+    # Get current replica assignment
+    topics_before = call_kafka_info(
+        host,
+        {
+            'resource': 'topic',
+            'include_internal': False
+        }
+    )
+    
+    current_replicas = None
+    for broker_topics in topics_before:
+        if topic_name in broker_topics['ansible_module_results']:
+            topic_data = broker_topics['ansible_module_results'][topic_name]
+            if '0' in topic_data:
+                current_replicas = topic_data['0']['replicas']
+                break
+    
+    assert current_replicas is not None, "Could not get current replica assignment"
+    assert len(current_replicas) == 3, f"Expected 3 replicas, got {len(current_replicas)}"
+    
+    # When - decrease replica factor with preserve_leader=True
+    test_topic_configuration = topic_defaut_configuration.copy()
+    test_topic_configuration.update({
+        'replica_factor': 2,
+        'preserve_leader': True
+    })
+    ensure_idempotency(
+        ensure_kafka_topic_with_zk,
+        host,
+        test_topic_configuration,
+        topic_name
+    )
+    time.sleep(0.3)
+    
+    # Then - verify leader is preserved and movement is minimized
+    topics_after = call_kafka_info(
+        host,
+        {
+            'resource': 'topic',
+            'include_internal': False
+        }
+    )
+    
+    new_replicas = None
+    for broker_topics in topics_after:
+        if topic_name in broker_topics['ansible_module_results']:
+            topic_data = broker_topics['ansible_module_results'][topic_name]
+            if '0' in topic_data:
+                new_replicas = topic_data['0']['replicas']
+                break
+    
+    assert new_replicas is not None, "Could not get new replica assignment"
+    assert len(new_replicas) == 2, f"Expected 2 replicas, got {len(new_replicas)}"
+    
+    # Verify leader is preserved (first replica should be the same)
+    assert new_replicas[0] == current_replicas[0], \
+        f"Leader not preserved: was {current_replicas[0]}, now {new_replicas[0]}"
+    
+    # Verify at least one more replica from the original set is preserved
+    original_replicas_preserved = set(current_replicas) & set(new_replicas)
+    assert len(original_replicas_preserved) >= 2, \
+        f"Not enough original replicas preserved: original={current_replicas}, new={new_replicas}"
+
+
+def test_preserve_leader_increases_replica_factor(host):
+    """
+    Test that preserve_leader=True preserves existing replicas when increasing
+    replica factor and adds new ones.
+    """
+    # Given
+    topic_name = get_topic_name()
+    
+    # Create topic with replica factor 2
+    initial_config = topic_defaut_configuration.copy()
+    initial_config.update({
+        'replica_factor': 2,
+        'partitions': 1
+    })
+    ensure_kafka_topic(
+        host,
+        initial_config,
+        topic_name
+    )
+    time.sleep(0.3)
+    
+    # Get current replica assignment
+    topics_before = call_kafka_info(
+        host,
+        {
+            'resource': 'topic',
+            'include_internal': False
+        }
+    )
+    
+    current_replicas = None
+    for broker_topics in topics_before:
+        if topic_name in broker_topics['ansible_module_results']:
+            topic_data = broker_topics['ansible_module_results'][topic_name]
+            if '0' in topic_data:
+                current_replicas = topic_data['0']['replicas']
+                break
+    
+    assert current_replicas is not None, "Could not get current replica assignment"
+    assert len(current_replicas) == 2, f"Expected 2 replicas, got {len(current_replicas)}"
+    
+    # When - increase replica factor with preserve_leader=True
+    test_topic_configuration = topic_defaut_configuration.copy()
+    test_topic_configuration.update({
+        'replica_factor': 3,
+        'preserve_leader': True
+    })
+    ensure_idempotency(
+        ensure_kafka_topic_with_zk,
+        host,
+        test_topic_configuration,
+        topic_name
+    )
+    time.sleep(0.3)
+    
+    # Then - verify all original replicas are preserved
+    topics_after = call_kafka_info(
+        host,
+        {
+            'resource': 'topic',
+            'include_internal': False
+        }
+    )
+    
+    new_replicas = None
+    for broker_topics in topics_after:
+        if topic_name in broker_topics['ansible_module_results']:
+            topic_data = broker_topics['ansible_module_results'][topic_name]
+            if '0' in topic_data:
+                new_replicas = topic_data['0']['replicas']
+                break
+    
+    assert new_replicas is not None, "Could not get new replica assignment"
+    assert len(new_replicas) == 3, f"Expected 3 replicas, got {len(new_replicas)}"
+    
+    # Verify all original replicas are preserved
+    for original_replica in current_replicas:
+        assert original_replica in new_replicas, \
+            f"Original replica {original_replica} not preserved in {new_replicas}"
