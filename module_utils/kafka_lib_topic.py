@@ -30,9 +30,18 @@ def process_module_topics(module, params=None):
         )
         return
 
-    # Validate json_assignment parameter conflicts
+    # Validate parameter conflicts for all topics
     for topic in topics:
         json_assignment = topic.get('json_assignment')
+        
+        # Validate preserve_leader and preserve_current_replicas conflicts (always)
+        if topic.get('preserve_leader', False) and topic.get('preserve_current_replicas', False):
+            module.fail_json(
+                msg='Cannot use both preserve_leader and preserve_current_replicas for topic %s' % topic['name']
+            )
+            return
+        
+        # Validate json_assignment parameter conflicts
         if json_assignment is not None:
             # Check for conflicting parameters
             if topic.get('partitions', 0) > 0:
@@ -51,10 +60,15 @@ def process_module_topics(module, params=None):
                 )
                 return
             
-            # Validate preserve_leader and preserve_current_replicas conflicts
-            if topic.get('preserve_leader', False) and topic.get('preserve_current_replicas', False):
+            # json_assignment cannot be used with preserve_leader or preserve_current_replicas
+            if topic.get('preserve_leader', False):
                 module.fail_json(
-                    msg='Cannot use both preserve_leader and preserve_current_replicas for topic %s' % topic['name']
+                    msg='Cannot use json_assignment with preserve_leader parameter for topic %s' % topic['name']
+                )
+                return
+            if topic.get('preserve_current_replicas', False):
+                module.fail_json(
+                    msg='Cannot use json_assignment with preserve_current_replicas parameter for topic %s' % topic['name']
                 )
                 return
             

@@ -978,14 +978,15 @@ class KafkaManager:
                 return current_replicas
             
             # Use round-robin to select new brokers
-            brokers_iterator = itertools.cycle(available_brokers)
-            while len(new_replicas) < target_factor:
-                if available_brokers:  # Check if there are available brokers
+            if available_brokers:
+                brokers_iterator = itertools.cycle(available_brokers)
+                while len(new_replicas) < target_factor:
                     new_broker = next(brokers_iterator)
                     if new_broker not in new_replicas:
                         new_replicas.append(new_broker)
-                else:
-                    break  # No more brokers available
+                    # Safety check to prevent infinite loops
+                    if len(new_replicas) >= len(all_brokers):
+                        break
             
             return new_replicas
 
@@ -1048,14 +1049,6 @@ class KafkaManager:
                             replicas.append(leader)
                             overflow_nodes.append(leader)
                         for _i in range(partition_replica_factor):
-                            broker = next(brokers_iterator)
-                            while broker in overflow_nodes or broker in replicas:
-                                if broker in overflow_nodes:
-                                    overflow_nodes.remove(broker)
-                                broker = next(brokers_iterator)
-                            replicas.append(broker)
-                            if broker in overflow_nodes:
-                                overflow_nodes.remove(broker)
                             broker = next(brokers_iterator)
                             while broker in overflow_nodes or broker in replicas:
                                 if broker in overflow_nodes:
