@@ -911,7 +911,7 @@ class KafkaManager:
                     if preserve_current_replicas:
                         # Preserve current replica set logic
                         replicas = self._get_preserved_replicas(
-                            current_replicas, replica_factor, all_replicas, leader
+                            current_replicas, replica_factor, all_replicas, leader, partition
                         )
                     else:
                         # Original logic for preserve_leader or normal assignment
@@ -930,8 +930,8 @@ class KafkaManager:
                             replicas.append(broker)
                     
                     current_assignment = topics_configuration.get((topic_name, partition), [])
-                    sorted(replicas)
-                    sorted(current_assignment)
+                    replicas = sorted(replicas)
+                    current_assignment = sorted(current_assignment)
                     if (topic_name, partition) in topics_configuration and \
                        replicas != current_assignment:
                         assign_tmp = (
@@ -943,11 +943,49 @@ class KafkaManager:
 
                 if len(partitions) > 0:
                     assigments.append((topic_name, partitions, {}))
+        
+        # Validate that all broker assignments contain only available brokers
+        for topic_name, partitions, _ in assigments:
+            for partition, replicas, __ in partitions:
+                self._validate_broker_availability(replicas,
+                    f"partition {partition} assignment for topic '{topic_name}'")
+        
         if len(assigments) == 0:
             return None
         return assigments
 
-    def _get_preserved_replicas(self, current_replicas, target_factor, all_brokers, leader=None):
+    def _validate_broker_availability(self, brokers, broker_list_name="broker list"):
+        """
+        Validate that all brokers in the provided list are available.
+        
+        Args:
+            brokers: List of broker IDs to validate
+            broker_list_name: Name of the broker list for error messages
+            
+        Raises:
+            KafkaManagerError: If any broker in the list is unavailable
+        """
+        available_brokers = set()
+        for broker in self.get_brokers():
+            available_brokers.add(broker.nodeId)
+        
+        unavailable_brokers = []
+        for broker_id in brokers:
+            if broker_id not in available_brokers:
+                unavailable_brokers.append(broker_id)
+        
+        if unavailable_brokers:
+            raise KafkaManagerError(
+                'Unable to proceed with partition reassignment: '
+                'broker(s) %s in %s are not available. '
+                'Available brokers: %s' % (
+                    unavailable_brokers,
+                    broker_list_name,
+                    sorted(available_brokers)
+                )
+            )
+
+    def _get_preserved_replicas(self, current_replicas, target_factor, all_brokers, leader=None, partition_id=None):
         """
         Get preserved replicas based on current replica set and target factor.
         
@@ -956,6 +994,7 @@ class KafkaManager:
             target_factor: Target replica factor
             all_brokers: List of all available brokers
             leader: Current leader broker ID (optional)
+            partition_id: Partition ID for deterministic broker selection (optional)
             
         Returns:
             List of replica broker IDs for the new assignment
@@ -967,7 +1006,10 @@ class KafkaManager:
             return current_replicas
         elif target_factor < len(current_replicas):
             # Decreasing replica factor - remove from the end
-            return current_replicas[:target_factor]
+            # Validate that the resulting replica list doesn't contain unavailable brokers
+            truncated_replicas = current_replicas[:target_factor]
+            self._validate_broker_availability(truncated_replicas, "truncated replica list")
+            return truncated_replicas
         else:
             # Increasing replica factor - add new replicas
             new_replicas = current_replicas.copy()
@@ -977,16 +1019,26 @@ class KafkaManager:
                 # If no available brokers, we can't add more replicas
                 return current_replicas
             
-            # Use round-robin to select new brokers
-            if available_brokers:
-                brokers_iterator = itertools.cycle(available_brokers)
-                while len(new_replicas) < target_factor:
-                    new_broker = next(brokers_iterator)
-                    if new_broker not in new_replicas:
-                        new_replicas.append(new_broker)
-                    # Safety check to prevent infinite loops
-                    if len(new_replicas) >= len(all_brokers):
-                        break
+            # Sort available brokers for deterministic selection
+            available_brokers = sorted(available_brokers)
+            
+            # Use partition_id to determine starting position for deterministic selection
+            # This ensures different partitions get different additional brokers
+            if partition_id is not None and len(available_brokers) > 0:
+                start_index = partition_id % len(available_brokers)
+            else:
+                start_index = 0
+            
+            # Add brokers starting from the calculated position
+            brokers_needed = target_factor - len(current_replicas)
+            for i in range(brokers_needed):
+                broker_index = (start_index + i) % len(available_brokers)
+                new_broker = available_brokers[broker_index]
+                if new_broker not in new_replicas:
+                    new_replicas.append(new_broker)
+                # If we've exhausted all available brokers, break
+                if len(new_replicas) >= len(all_brokers):
+                    break
             
             return new_replicas
 
@@ -1038,7 +1090,7 @@ class KafkaManager:
                     if preserve_current_replicas:
                         # Preserve current replica set logic
                         replicas = self._get_preserved_replicas(
-                            current_replicas, replica_factor, all_replicas, leader
+                            current_replicas, replica_factor, all_replicas, leader, partition
                         )
                     else:
                         # Original logic for preserve_leader or normal assignment
@@ -1057,8 +1109,8 @@ class KafkaManager:
                             replicas.append(broker)
                     
                     current_assignment = topics_configuration.get((topic_name, partition), [])
-                    sorted(replicas)
-                    sorted(current_assignment)
+                    replicas = sorted(replicas)
+                    current_assignment = sorted(current_assignment)
                     if (topic_name, partition) in topics_configuration and \
                        replicas != current_assignment:
                         assign_tmp = {
@@ -1068,9 +1120,14 @@ class KafkaManager:
                         }
                         assign['partitions'].append(assign_tmp)
 
-            if len(assign['partitions']) == 0:
-                return None
-            return json.dumps(assign, ensure_ascii=False).encode('utf-8')
+        # Validate that all broker assignments contain only available brokers
+        for partition_assignment in assign['partitions']:
+            self._validate_broker_availability(partition_assignment['replicas'],
+                f"partition {partition_assignment['partition']} assignment for topic '{partition_assignment['topic']}'")
+
+        if len(assign['partitions']) == 0:
+            return None
+        return json.dumps(assign, ensure_ascii=False).encode('utf-8')
 
     def get_assignment_for_partition_update(self, topic_name, partitions):
         """
@@ -1243,6 +1300,11 @@ Cf core/src/main/scala/kafka/admin/ReassignPartitionsCommand.scala#L580
                     'Partition assignment topic "%s" does not match requested topic "%s"' %
                     (partition['topic'], topic_name)
                 )
+        
+        # Validate that all broker assignments contain only available brokers
+        for partition in partitions:
+            self._validate_broker_availability(partition['replicas'],
+                f"partition {partition['partition']} assignment for topic '{partition['topic']}'")
         
         # Convert to the format expected by update_admin_assignments
         topics_configuration = {}
@@ -1823,7 +1885,8 @@ structure:
             self.update_admin_assignments({
                 topic['name']: {
                     'replica_factor': topic['replica_factor'],
-                    'preserve_leader': topic.get('preserve_leader', False)
+                    'preserve_leader': topic.get('preserve_leader', False),
+                    'preserve_current_replicas': topic.get('preserve_current_replicas', False)
                 }
                 for topic in topics if (topic['name']
                                         in topics_replication_need_update)
