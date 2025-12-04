@@ -775,12 +775,29 @@ class KafkaManager:
         topics_need_update = []
 
         for topic_name, options in topics.items():
+            preserve_current_replicas = options.get('preserve_current_replicas', False)
+            force_reassign = options.get('force_reassign', False)
+            target_replica_factor = options['replica_factor']
+            
             for _id, metadata in self.get_partitions_for_topic(
                     topic_name).items():
                 _topic, _partition, _leader, replicas, _isr, _error = metadata
-                if (len(replicas) != options['replica_factor']
-                        or options['force_reassign']):
+                current_replica_count = len(replicas)
+                
+                needs_update = False
+                
+                if force_reassign:
+                    needs_update = True
+                elif current_replica_count != target_replica_factor:
+                    needs_update = True
+                elif preserve_current_replicas:
+                    # With preserve_current_replicas, only update if RF actually changed
+                    # Don't update just because the flag is set
+                    needs_update = False
+                
+                if needs_update:
                     topics_need_update.append(topic_name)
+                    break  # One partition is enough to mark the whole topic
 
         return topics_need_update
 
@@ -908,11 +925,48 @@ class KafkaManager:
                         topic_name).items():
                     _, partition, leader, current_replicas, _, _ = metadata
                     
+                    # Convert current_replicas to list to ensure it's mutable and in the correct order
+                    current_replicas = list(current_replicas)
+                    
                     if preserve_current_replicas:
-                        # Preserve current replica set logic
-                        replicas = self._get_preserved_replicas(
-                            current_replicas, replica_factor, all_replicas, leader, partition
-                        )
+                        # Use the enhanced logic adapted from preserve_leader
+                        # Get current replica set to minimize movements
+                        if (topic_name, partition) in topics_configuration:
+                            current_assignment = topics_configuration[(topic_name, partition)]
+                            current_replica_count = len(current_assignment)
+                            
+                            # Only update if replica factor actually changed
+                            if replica_factor != current_replica_count:
+                                replicas = []
+                                
+                                if len(current_assignment) >= replica_factor:
+                                    # Decreasing replica factor: preserve existing replicas, trim from end
+                                    replicas = current_assignment[:replica_factor]
+                                else:
+                                    # Increasing replica factor: preserve existing replicas, add new ones
+                                    replicas = list(current_assignment)
+                                    
+                                    # Calculate how many new replicas we need
+                                    needed_new_replicas = replica_factor - len(replicas)
+                                    
+                                    # Add new replicas using round-robin, avoiding existing ones
+                                    for _i in range(needed_new_replicas):
+                                        broker = next(brokers_iterator)
+                                        while broker in overflow_nodes or broker in replicas:
+                                            if broker in overflow_nodes:
+                                                overflow_nodes.remove(broker)
+                                            broker = next(brokers_iterator)
+                                        replicas.append(broker)
+                                
+                                # Validate broker availability
+                                self._validate_broker_availability(replicas,
+                                    f"partition {partition} assignment for topic '{topic_name}'")
+                            else:
+                                # Same replica factor - keep current assignment
+                                replicas = current_assignment
+                        else:
+                            # No current assignment info, use current replicas
+                            replicas = list(current_replicas)
                     else:
                         # Original logic for preserve_leader or normal assignment
                         partition_replica_factor = replica_factor
@@ -930,10 +984,9 @@ class KafkaManager:
                             replicas.append(broker)
                     
                     current_assignment = topics_configuration.get((topic_name, partition), [])
-                    replicas = sorted(replicas)
-                    current_assignment = sorted(current_assignment)
-                    if (topic_name, partition) in topics_configuration and \
-                       replicas != current_assignment:
+                    
+                    # Only update if replicas actually changed
+                    if replicas != current_assignment:
                         assign_tmp = (
                             partition,
                             replicas,
@@ -985,63 +1038,6 @@ class KafkaManager:
                 )
             )
 
-    def _get_preserved_replicas(self, current_replicas, target_factor, all_brokers, leader=None, partition_id=None):
-        """
-        Get preserved replicas based on current replica set and target factor.
-        
-        Args:
-            current_replicas: List of current replica broker IDs
-            target_factor: Target replica factor
-            all_brokers: List of all available brokers
-            leader: Current leader broker ID (optional)
-            partition_id: Partition ID for deterministic broker selection (optional)
-            
-        Returns:
-            List of replica broker IDs for the new assignment
-        """
-        current_replicas = list(current_replicas)
-        
-        if target_factor == len(current_replicas):
-            # No change needed
-            return current_replicas
-        elif target_factor < len(current_replicas):
-            # Decreasing replica factor - remove from the end
-            # Validate that the resulting replica list doesn't contain unavailable brokers
-            truncated_replicas = current_replicas[:target_factor]
-            self._validate_broker_availability(truncated_replicas, "truncated replica list")
-            return truncated_replicas
-        else:
-            # Increasing replica factor - add new replicas
-            new_replicas = current_replicas.copy()
-            available_brokers = [b for b in all_brokers if b not in current_replicas]
-            
-            if not available_brokers:
-                # If no available brokers, we can't add more replicas
-                return current_replicas
-            
-            # Sort available brokers for deterministic selection
-            available_brokers = sorted(available_brokers)
-            
-            # Use partition_id to determine starting position for deterministic selection
-            # This ensures different partitions get different additional brokers
-            if partition_id is not None and len(available_brokers) > 0:
-                start_index = partition_id % len(available_brokers)
-            else:
-                start_index = 0
-            
-            # Add brokers starting from the calculated position
-            brokers_needed = target_factor - len(current_replicas)
-            for i in range(brokers_needed):
-                broker_index = (start_index + i) % len(available_brokers)
-                new_broker = available_brokers[broker_index]
-                if new_broker not in new_replicas:
-                    new_replicas.append(new_broker)
-                # If we've exhausted all available brokers, break
-                if len(new_replicas) >= len(all_brokers):
-                    break
-            
-            return new_replicas
-
     def get_assignment_for_replica_factor_update_with_zk(self, topics,
                                                          topics_configuration):
         """
@@ -1088,10 +1084,40 @@ class KafkaManager:
                     _, partition, leader, current_replicas, _, _ = metadata
                     
                     if preserve_current_replicas:
-                        # Preserve current replica set logic
-                        replicas = self._get_preserved_replicas(
-                            current_replicas, replica_factor, all_replicas, leader, partition
-                        )
+                        # Use the enhanced logic adapted from preserve_leader
+                        # Get current replica set to minimize movements
+                        if (topic_name, partition) in topics_configuration:
+                            current_assignment = topics_configuration[(topic_name, partition)]
+                            current_replica_count = len(current_assignment)
+                            
+                            # Only update if replica factor actually changed
+                            if replica_factor != current_replica_count:
+                                replicas = []
+                                
+                                if len(current_assignment) >= replica_factor:
+                                    # Decreasing replica factor: preserve existing replicas, trim from end
+                                    replicas = current_assignment[:replica_factor]
+                                else:
+                                    # Increasing replica factor: preserve existing replicas, add new ones
+                                    replicas = list(current_assignment)
+                                    
+                                    # Calculate how many new replicas we need
+                                    needed_new_replicas = replica_factor - len(replicas)
+                                    
+                                    # Add new replicas using round-robin, avoiding existing ones
+                                    for _i in range(needed_new_replicas):
+                                        broker = next(brokers_iterator)
+                                        while broker in overflow_nodes or broker in replicas:
+                                            if broker in overflow_nodes:
+                                                overflow_nodes.remove(broker)
+                                            broker = next(brokers_iterator)
+                                        replicas.append(broker)
+                            else:
+                                # Same replica factor - keep current assignment
+                                replicas = current_assignment
+                        else:
+                            # No current assignment info, use current replicas
+                            replicas = list(current_replicas)
                     else:
                         # Original logic for preserve_leader or normal assignment
                         partition_replica_factor = replica_factor
@@ -1109,8 +1135,6 @@ class KafkaManager:
                             replicas.append(broker)
                     
                     current_assignment = topics_configuration.get((topic_name, partition), [])
-                    replicas = sorted(replicas)
-                    current_assignment = sorted(current_assignment)
                     if (topic_name, partition) in topics_configuration and \
                        replicas != current_assignment:
                         assign_tmp = {
@@ -1237,7 +1261,8 @@ Cf core/src/main/scala/kafka/admin/ReassignPartitionsCommand.scala#L580
             partitions = self.get_partitions_for_topic(topic)
             for partition, metadata in partitions.items():
                 _, _, _, replicas, _, _ = metadata
-                topics_configuration[(topic, partition)] = replicas
+                # Ensure we store a copy of the replicas list to maintain order
+                topics_configuration[(topic, partition)] = list(replicas)
         if (parse_version(self.get_api_version()) >= parse_version('2.4.0')):
             assign = self.get_assignment_for_replica_factor_update(
                 topics,
@@ -1824,7 +1849,8 @@ structure:
             self.is_topics_replication_need_update({
                 topic['name']: {
                     'replica_factor': topic['replica_factor'],
-                    'force_reassign': topic.get('force_reassign', False)
+                    'force_reassign': topic.get('force_reassign', False),
+                    'preserve_current_replicas': topic.get('preserve_current_replicas', False)
                 }
                 for topic in topics
             })
@@ -1877,7 +1903,8 @@ structure:
             self.is_topics_replication_need_update({
                 topic['name']: {
                     'replica_factor': topic['replica_factor'],
-                    'force_reassign': topic.get('force_reassign', False)
+                    'force_reassign': topic.get('force_reassign', False),
+                    'preserve_current_replicas': topic.get('preserve_current_replicas', False)
                 }
                 for topic in topics
             })
