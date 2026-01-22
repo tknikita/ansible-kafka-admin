@@ -73,38 +73,102 @@ class JsonAssignmentValidator:
                         module.fail_json(msg=error_msg)
                     raise KafkaManagerError(error_msg)
             
-            if not isinstance(partition['replicas'], list):
-                error_msg = 'Partition %d replicas must be an array' % i
-                if module:
-                    module.fail_json(msg=error_msg)
-                raise KafkaManagerError(error_msg)
-            
-            if len(partition['replicas']) == 0:
-                error_msg = 'Partition %d replicas array cannot be empty' % i
-                if module:
-                    module.fail_json(msg=error_msg)
-                raise KafkaManagerError(error_msg)
+            # Allow None for replicas when cancelling reassignments
+            if partition['replicas'] is not None:
+                if not isinstance(partition['replicas'], list):
+                    error_msg = 'Partition %d replicas must be an array or null' % i
+                    if module:
+                        module.fail_json(msg=error_msg)
+                    raise KafkaManagerError(error_msg)
+                
+                if len(partition['replicas']) == 0:
+                    error_msg = 'Partition %d replicas array cannot be empty' % i
+                    if module:
+                        module.fail_json(msg=error_msg)
+                    raise KafkaManagerError(error_msg)
         
         return assignment_data
     
     @staticmethod
-    def validate_broker_availability(partitions, manager):
+    def validate_partition_existence(partitions, manager):
         """
-        Validate that all brokers in assignments are available
+        Validate that all specified partitions exist in their respective topics
         
         Args:
             partitions: List of partition assignments
             manager: KafkaManager instance
             
         Raises:
+            KafkaManagerError: If any partition doesn't exist
+        """
+        # Get all topics from the cluster
+        all_topics = manager.get_topics(include_internal=False)
+        
+        # Group partitions by topic for efficient validation
+        topics_to_partitions = {}
+        for partition in partitions:
+            topic_name = partition['topic']
+            if topic_name not in topics_to_partitions:
+                topics_to_partitions[topic_name] = []
+            topics_to_partitions[topic_name].append(partition)
+        
+        # Validate each topic and its partitions
+        for topic_name, topic_partitions in topics_to_partitions.items():
+            # Check if topic exists
+            if topic_name not in all_topics:
+                raise KafkaManagerError(
+                    'Unable to proceed with partition reassignment: '
+                    'topic "%s" does not exist. '
+                    'Available topics: %s' % (
+                        topic_name,
+                        sorted(all_topics)
+                    )
+                )
+            
+            # Get total number of partitions for this topic
+            total_partitions = manager.get_total_partitions_for_topic(topic_name)
+            
+            # Check if specified partitions exist
+            for partition in topic_partitions:
+                partition_id = partition['partition']
+                if partition_id < 0 or partition_id >= total_partitions:
+                    raise KafkaManagerError(
+                        'Unable to proceed with partition reassignment: '
+                        'partition %d does not exist in topic "%s". '
+                        'Topic has %d partitions (valid range: 0-%d).' % (
+                            partition_id,
+                            topic_name,
+                            total_partitions,
+                            total_partitions - 1
+                        )
+                    )
+    
+    @staticmethod
+    def validate_broker_availability(partitions, manager, cancel=False):
+        """
+        Validate that all brokers in assignments are available
+        
+        Args:
+            partitions: List of partition assignments
+            manager: KafkaManager instance
+            cancel: Whether this is a cancellation operation
+            
+        Raises:
             KafkaManagerError: If any broker is unavailable
         """
+        # Skip broker validation for cancellations
+        if cancel:
+            return
+        
         available_brokers = set()
         for broker in manager.get_brokers():
             available_brokers.add(broker.nodeId)
         
         for partition in partitions:
             replicas = partition['replicas']
+            if replicas is None:
+                continue
+            
             unavailable_brokers = []
             
             for broker_id in replicas:
@@ -122,6 +186,46 @@ class JsonAssignmentValidator:
                         sorted(available_brokers)
                     )
                 )
+    
+    @staticmethod
+    def validate_unique_broker_ids(partitions, module=None, cancel=False):
+        """
+        Validate that all broker IDs in replica lists are unique within each partition
+        
+        Args:
+            partitions: List of partition assignments
+            module: Ansible module for error reporting (optional)
+            cancel: Whether this is a cancellation operation
+            
+        Raises:
+            KafkaManagerError: If any partition has duplicate broker IDs
+        """
+        for partition in partitions:
+            replicas = partition['replicas']
+            if replicas is None:
+                continue
+            
+            # Check for duplicates by comparing list length with set length
+            if len(replicas) != len(set(replicas)):
+                # Find duplicate broker IDs
+                seen = set()
+                duplicates = []
+                for broker_id in replicas:
+                    if broker_id in seen:
+                        duplicates.append(broker_id)
+                    seen.add(broker_id)
+                
+                error_msg = (
+                    'Partition %d assignment for topic "%s" contains duplicate broker ID(s): %s. '
+                    'Each broker ID must appear only once in the replicas list.' % (
+                        partition['partition'],
+                        partition['topic'],
+                        sorted(set(duplicates))
+                    )
+                )
+                if module:
+                    module.fail_json(msg=error_msg)
+                raise KafkaManagerError(error_msg)
 
 
 class JsonAssignmentProcessor:
@@ -144,7 +248,7 @@ class JsonAssignmentProcessor:
             return json_assignment
     
     @staticmethod
-    def apply_assignment(manager, json_assignment, wait_for_completion=True):
+    def apply_assignment(manager, json_assignment, wait_for_completion=True, cancel=False):
         """
         Apply JSON assignment to Kafka cluster
         
@@ -152,6 +256,7 @@ class JsonAssignmentProcessor:
             manager: KafkaManager instance
             json_assignment: JSON assignment data
             wait_for_completion: Whether to wait for reassignment completion
+            cancel: Whether this is a cancellation operation
             
         Raises:
             KafkaManagerError: If application fails
@@ -162,8 +267,14 @@ class JsonAssignmentProcessor:
         assignment_data = JsonAssignmentProcessor.parse_assignment(json_assignment)
         partitions = assignment_data['partitions']
         
-        # Validate broker availability
-        JsonAssignmentValidator.validate_broker_availability(partitions, manager)
+        # Validate partition existence
+        JsonAssignmentValidator.validate_partition_existence(partitions, manager)
+        
+        # Validate broker availability (skip for cancellations)
+        JsonAssignmentValidator.validate_broker_availability(partitions, manager, cancel)
+        
+        # Validate unique broker IDs in replica lists (skip for cancellations)
+        JsonAssignmentValidator.validate_unique_broker_ids(partitions, cancel=cancel)
         
         # Group partitions by topic for efficient processing
         topics_to_partitions = {}
@@ -175,8 +286,10 @@ class JsonAssignmentProcessor:
         
         # Apply assignment based on Kafka version
         if parse_version(manager.get_api_version()) >= parse_version('2.4.0'):
-            JsonAssignmentProcessor._apply_assignment_new_api(manager, topics_to_partitions, wait_for_completion)
+            JsonAssignmentProcessor._apply_assignment_new_api(manager, topics_to_partitions, wait_for_completion, cancel)
         elif manager.zk_configuration is not None:
+            if cancel:
+                raise KafkaManagerError('Cancelling reassignments requires Kafka >= 2.4.0. ZooKeeper-based cancellation is not supported.')
             JsonAssignmentProcessor._apply_assignment_zookeeper(manager, assignment_data, wait_for_completion)
         else:
             raise KafkaManagerError('Zookeeper is mandatory for partition assignment when using Kafka <= 2.4.0.')
@@ -184,7 +297,7 @@ class JsonAssignmentProcessor:
         manager.refresh()
     
     @staticmethod
-    def _apply_assignment_new_api(manager, topics_to_partitions, wait_for_completion):
+    def _apply_assignment_new_api(manager, topics_to_partitions, wait_for_completion, cancel=False):
         """Apply assignment using Kafka >= 2.4.0 API"""
         from pkg_resources import parse_version
         from ansible.module_utils.kafka_protocol import AlterPartitionReassignmentsRequest_v0
@@ -194,9 +307,11 @@ class JsonAssignmentProcessor:
         for topic_name, partitions in topics_to_partitions.items():
             partition_assignments = []
             for partition in partitions:
+                # For cancellation, replicas should be None
+                replicas = None if cancel else partition['replicas']
                 partition_assignments.append((
                     partition['partition'],
-                    partition['replicas'],
+                    replicas,
                     {}
                 ))
             assign.append((topic_name, partition_assignments, {}))
@@ -208,12 +323,16 @@ class JsonAssignmentProcessor:
                 tags={}
             )
             
-            if wait_for_completion:
+            # For cancellation, don't wait for reassignment to complete
+            # The cancellation happens immediately
+            if wait_for_completion and not cancel:
                 manager.wait_for_partition_assignement()
             
             manager.send_request_and_get_response(request)
             
-            if wait_for_completion:
+            # For cancellation, don't wait for reassignment to complete
+            # The cancellation happens immediately
+            if wait_for_completion and not cancel:
                 manager.wait_for_partition_assignement()
     
     @staticmethod
@@ -250,13 +369,92 @@ class ReassignmentManager:
         self.validator = JsonAssignmentValidator()
         self.processor = JsonAssignmentProcessor()
     
-    def validate_assignment(self, json_assignment, module=None):
+    def validate_assignment(self, json_assignment, module=None, cancel=False):
         """Validate a JSON assignment"""
-        return self.validator.validate_assignment_format(json_assignment, module)
+        validated_assignment = self.validator.validate_assignment_format(json_assignment, module)
+        
+        # Validate partition existence if there are partitions to validate
+        if len(validated_assignment['partitions']) > 0:
+            self.validator.validate_partition_existence(validated_assignment['partitions'], self.manager)
+            self.validator.validate_unique_broker_ids(validated_assignment['partitions'], module, cancel)
+            self.validator.validate_broker_availability(validated_assignment['partitions'], self.manager, cancel)
+        
+        return validated_assignment
     
     def apply_assignment(self, json_assignment, wait_for_completion=True):
         """Apply a JSON assignment to the cluster"""
-        self.processor.apply_assignment(self.manager, json_assignment, wait_for_completion)
+        from pkg_resources import parse_version
+        
+        # Check if there's already an active reassignment
+        status = self.get_assignment_status()
+        
+        # Determine if reassignment is in progress based on the response format
+        reassignment_in_progress = False
+        if parse_version(self.manager.get_api_version()) >= parse_version('2.4.0'):
+            # For Kafka >= 2.4.0, check if there are any ongoing reassignments
+            if status.get('topics') and len(status['topics']) > 0:
+                reassignment_in_progress = True
+        else:
+            # For older versions, check the boolean flag
+            reassignment_in_progress = status.get('reassignment_in_progress', False)
+        
+        if reassignment_in_progress:
+            raise KafkaManagerError(
+                'Unable to proceed with partition reassignment: '
+                'a reassignment is already in progress. '
+                'Please wait for the current reassignment to complete before starting a new one.'
+            )
+        
+        self.processor.apply_assignment(self.manager, json_assignment, wait_for_completion, cancel=False)
+    
+    def cancel_assignment(self, json_assignment, wait_for_completion=True):
+        """Cancel ongoing partition reassignments"""
+        from pkg_resources import parse_version
+        
+        # Check Kafka version
+        if parse_version(self.manager.get_api_version()) < parse_version('2.4.0'):
+            raise KafkaManagerError(
+                'Cancelling reassignments requires Kafka >= 2.4.0. '
+                'Current version: %s' % self.manager.get_api_version()
+            )
+        
+        # Get current reassignment status
+        status = self.get_assignment_status()
+        
+        # Parse the assignment to get the list of partitions to cancel
+        assignment_data = JsonAssignmentProcessor.parse_assignment(json_assignment)
+        partitions_to_cancel = assignment_data['partitions']
+        
+        # Build a map of active reassignments
+        active_reassignments = {}
+        if status.get('topics'):
+            for topic_data in status['topics']:
+                topic_name = topic_data.get('name')
+                if topic_name and topic_data.get('partitions'):
+                    for partition_data in topic_data['partitions']:
+                        partition_id = partition_data.get('partition_index')
+                        if partition_id is not None:
+                            key = (topic_name, partition_id)
+                            active_reassignments[key] = True
+        
+        # Filter out partitions that don't have active reassignments
+        partitions_with_active_reassignment = []
+        for partition in partitions_to_cancel:
+            key = (partition['topic'], partition['partition'])
+            if key in active_reassignments:
+                partitions_with_active_reassignment.append(partition)
+        
+        if not partitions_with_active_reassignment:
+            # No active reassignments to cancel
+            return
+        
+        # Create filtered assignment with only active reassignments
+        filtered_assignment = {
+            'partitions': partitions_with_active_reassignment
+        }
+        
+        # Apply cancellation
+        self.processor.apply_assignment(self.manager, filtered_assignment, wait_for_completion, cancel=True)
     
     def get_assignment_status(self):
         """Get current reassignment status"""

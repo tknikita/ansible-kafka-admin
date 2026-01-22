@@ -72,6 +72,14 @@ options:
       - 'useful for pre-flight checks of assignment validity.'
     default: False
     type: bool
+  cancel:
+    description:
+      - 'when True, cancel ongoing partition reassignments for the specified partitions.'
+      - 'to cancel a reassignment, the replicas field should be set to None or omitted.'
+      - 'only partitions with active reassignments will be affected.'
+      - 'requires Kafka >= 2.4.0.'
+    default: False
+    type: bool
 ''' + DOCUMENTATION_COMMON
 
 EXAMPLES = '''
@@ -134,8 +142,37 @@ EXAMPLES = '''
         bootstrap_servers: "kafka1:9092,kafka2:9092"
         assignment:
           partitions: []  # Empty assignment to just check status
-      register: reassign_status
-'''
+          register: reassign_status
+    
+        # Cancel ongoing reassignment
+        - name: Cancel partition reassignment
+          kafka_reassign:
+            bootstrap_servers: "kafka1:9092,kafka2:9092"
+            assignment:
+              partitions:
+                - topic: "my_topic"
+                  partition: 0
+                  replicas: null  # null indicates cancellation
+            cancel: true
+            wait_for_completion: true
+    
+        # Cancel multiple reassignments
+        - name: Cancel multiple partition reassignments
+          kafka_reassign:
+            bootstrap_servers: "kafka1:9092,kafka2:9092"
+            assignment:
+              partitions:
+                - topic: "topic1"
+                  partition: 0
+                  replicas: null
+                - topic: "topic1"
+                  partition: 1
+                  replicas: null
+                - topic: "topic2"
+                  partition: 0
+                  replicas: null
+            cancel: true
+    '''
 
 
 def main():
@@ -147,6 +184,7 @@ def main():
         assignment=dict(type='json', required=True),
         wait_for_completion=dict(type='bool', default=True),
         validate_only=dict(type='bool', default=False),
+        cancel=dict(type='bool', default=False),
         
         **module_commons
     )
@@ -160,6 +198,7 @@ def main():
     assignment = module.params['assignment']
     wait_for_completion = module.params['wait_for_completion']
     validate_only = module.params['validate_only']
+    cancel = module.params['cancel']
     check_mode = module.check_mode
 
     changed = False
@@ -193,22 +232,30 @@ def main():
             }
             module.exit_json(changed=False, msg=msg, changes=changes)
 
-        # Apply the reassignment
+        # Apply the reassignment or cancellation
         if not check_mode:
-            reassign_manager.apply_assignment(validated_assignment, wait_for_completion)
+            if cancel:
+                reassign_manager.cancel_assignment(validated_assignment, wait_for_completion)
+            else:
+                reassign_manager.apply_assignment(validated_assignment, wait_for_completion)
         
         changed = True
         partition_count = len(validated_assignment['partitions'])
         topics_affected = list(set(part['topic'] for part in validated_assignment['partitions']))
         
-        msg = 'Successfully initiated reassignment for %d partitions across %d topics' % (
-            partition_count, len(topics_affected))
+        if cancel:
+            msg = 'Successfully cancelled reassignment for %d partitions across %d topics' % (
+                partition_count, len(topics_affected))
+        else:
+            msg = 'Successfully initiated reassignment for %d partitions across %d topics' % (
+                partition_count, len(topics_affected))
         
         changes = {
             'partitions_reassigned': partition_count,
             'topics_affected': topics_affected,
             'assignment_applied': validated_assignment,
-            'wait_for_completion': wait_for_completion
+            'wait_for_completion': wait_for_completion,
+            'cancelled': cancel
         }
 
     except Exception as e:
