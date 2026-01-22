@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 import collections
-import json
 import traceback
 
 from kafka.errors import KafkaError
@@ -30,14 +29,13 @@ def process_module_topics(module, params=None):
         )
         return
 
-    # Validate parameter conflicts for all topics
-    for topic in topics:
-        # Validate preserve_leader and preserve_current_replicas conflicts (always)
-        if topic.get('preserve_leader', False) and topic.get('preserve_current_replicas', False):
-            module.fail_json(
-                msg='Cannot use both preserve_leader and preserve_current_replicas for topic %s' % topic['name']
-            )
-            return
+    for topic in topics:            
+            # Validate preserve_leader and preserve_current_replicas conflicts
+            if topic.get('preserve_leader', False) and topic.get('preserve_current_replicas', False):
+                module.fail_json(
+                    msg='Cannot use both preserve_leader and preserve_current_replicas for topic %s' % topic['name']
+                )
+                return
 
     changed = False
     msg = ''
@@ -64,7 +62,6 @@ def process_module_topics(module, params=None):
                 'topic_created': topics_to_create
             })
 
-        # Handle regular topic updates
         topics_to_maybe_update = [
             topic for topic in topics
             if (topic['state'] == 'present' and
@@ -125,9 +122,8 @@ def process_module_topics(module, params=None):
     finally:
         if manager:
             manager.close()
-        # Use cached SSL files from manager to avoid recreating them
-        maybe_clean_kafka_ssl_files(params, getattr(manager, 'kafka_ssl_files', None))
-        maybe_clean_zk_ssl_files(params, getattr(manager, 'zookeeper_ssl_files', None))
+        maybe_clean_kafka_ssl_files(params)
+        maybe_clean_zk_ssl_files(params)
 
     if not changed:
         msg += 'nothing to do.'
